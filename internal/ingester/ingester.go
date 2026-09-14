@@ -39,6 +39,9 @@ func New(authClient *auth.Client, wsURL string, tickers []string, eventChannel c
 }
 
 /*** ----------WebSocket JSON Message Types---------- ***/
+// these match Kalshi's current live schema (docs.kalshi.com/websockets/orderbook-updates),
+// which sends prices/quantities as fixed-point decimal STRINGS (the "_fp" fields below),
+// not integer cents - see models.FixedPoint for why we parse them the way we do.
 
 // outer envelope for every message from Kalshi
 type wsMessage struct {
@@ -51,11 +54,22 @@ type wsMessage struct {
 	Sid		string `json:"sid"` // subscription ID (e.g. "KXBTC-25APR16-12345")
 }
 
-// inner payload for both snapshots and deltas
-type wsOrderBookData struct {
+// inner payload for a full order book snapshot: the complete book for both sides
+type wsOrderBookSnapshot struct {
 	MarketTicker	string `json:"market_ticker"`
-	YesBids			[][]int `json:"yes"` // array of [price, quantity] pairs
-	NoBids			[][]int `json:"no"` // array of [price, quantity] pairs
+	// each entry is a [price_dollars, quantity] pair, both as fixed-point decimal strings,
+	// e.g. ["0.0800", "300.00"]
+	YesLevels		[][]string `json:"yes_dollars_fp"`
+	NoLevels		[][]string `json:"no_dollars_fp"`
+}
+
+// inner payload for a single incremental order book change: exactly one price level,
+// on exactly one side, changing by a signed amount
+type wsOrderBookDelta struct {
+	MarketTicker	string `json:"market_ticker"`
+	PriceDollars	string `json:"price_dollars"` // the price level that changed, e.g. "0.960"
+	DeltaFP			string `json:"delta_fp"`      // signed change to apply, e.g. "-54.00"
+	Side			string `json:"side"`           // "yes" or "no"
 }
 
 // JSON command we send TO Kalshi to subscribe to a market's order book updates
@@ -152,65 +166,116 @@ func (ing *Ingester) connectAndStream(ctx context.Context) error {
 	}
 }
 
-// parses a raw WebSocket message from Kalshi and pushes it to event channel
+// parses a raw WebSocket message from Kalshi and routes it based on its type
 func (ing *Ingester) handleMessage(rawMessage []byte) {
 	// parse outer envelope to check the message type and route accordingly
 	var msg wsMessage
-	// json.Unmarshal parses JSON data into a Go struct
 	if err := json.Unmarshal(rawMessage, &msg); err != nil {
 		ing.logger.Error("failed to parse WebSocket message", "error", err, "rawMessage", string(rawMessage))
 		return
 	}
-	// determine event type
-	var eventType string
 	switch msg.Type {
 	case "orderbook_snapshot":
-		eventType = "snapshot"
+		ing.handleSnapshot(msg)
 	case "orderbook_delta":
-		eventType = "delta"
+		ing.handleDelta(msg)
 	default:
 		ing.logger.Debug("ignoring message type", "type", msg.Type)
-		return
 	}
-	// parse inner payload
-	var data wsOrderBookData
+}
+
+// parses a full order book snapshot and pushes it to the event channel
+func (ing *Ingester) handleSnapshot(msg wsMessage) {
+	var data wsOrderBookSnapshot
 	if err := json.Unmarshal(msg.Msg, &data); err != nil {
-		ing.logger.Error("failed to parse orderbook data", "error", err)
+		ing.logger.Error("failed to parse orderbook snapshot", "error", err)
 		return
 	}
-	// check sequence numbers for gaps
-	if lastSeq, exists := ing.seqNums[data.MarketTicker]; exists {
-		if msg.Seq != lastSeq+1 && eventType == "delta" {
-			ing.logger.Warn("sequence number gap detected", "marketTicker", data.MarketTicker, "expected", lastSeq+1, "received", msg.Seq, "missed", msg.Seq - lastSeq - 1)
+	yesLevels, err := parseLevels(data.YesLevels)
+	if err != nil {
+		ing.logger.Error("failed to parse yes levels in snapshot", "error", err, "marketTicker", data.MarketTicker)
+		return
+	}
+	noLevels, err := parseLevels(data.NoLevels)
+	if err != nil {
+		ing.logger.Error("failed to parse no levels in snapshot", "error", err, "marketTicker", data.MarketTicker)
+		return
+	}
+	ing.checkSeqGap(data.MarketTicker, msg.Seq, "snapshot")
+	event := models.OrderBookEvent{
+		Type: "snapshot",
+		MarketTicker: data.MarketTicker,
+		SeqNum: msg.Seq,
+		YesLevels: yesLevels,
+		NoLevels: noLevels,
+		ReceivedAt: time.Now(),
+	}
+	ing.eventChannel <- event
+	ing.logger.Debug("snapshot forwarded", "ticker", data.MarketTicker, "seqNum", msg.Seq, "yesLevels", len(yesLevels), "noLevels", len(noLevels))
+}
+
+// parses a single incremental order book change and pushes it to the event channel
+func (ing *Ingester) handleDelta(msg wsMessage) {
+	var data wsOrderBookDelta
+	if err := json.Unmarshal(msg.Msg, &data); err != nil {
+		ing.logger.Error("failed to parse orderbook delta", "error", err)
+		return
+	}
+	price, err := models.ParseFixedPoint(data.PriceDollars)
+	if err != nil {
+		ing.logger.Error("failed to parse delta price", "error", err, "marketTicker", data.MarketTicker, "raw", data.PriceDollars)
+		return
+	}
+	quantity, err := models.ParseFixedPoint(data.DeltaFP)
+	if err != nil {
+		ing.logger.Error("failed to parse delta quantity", "error", err, "marketTicker", data.MarketTicker, "raw", data.DeltaFP)
+		return
+	}
+	ing.checkSeqGap(data.MarketTicker, msg.Seq, "delta")
+	event := models.OrderBookEvent{
+		Type: "delta",
+		MarketTicker: data.MarketTicker,
+		SeqNum: msg.Seq,
+		Side: data.Side,
+		DeltaPrice: price,
+		DeltaQuantity: quantity,
+		ReceivedAt: time.Now(),
+	}
+	ing.eventChannel <- event
+	ing.logger.Debug("delta forwarded", "ticker", data.MarketTicker, "seqNum", msg.Seq, "side", data.Side, "price", price.Dollars(), "delta", quantity.Dollars())
+}
+
+// checks for a gap in sequence numbers for this ticker and logs a warning if one is found.
+// always records seq as the latest sequence number seen, regardless of whether a gap was found.
+func (ing *Ingester) checkSeqGap(ticker string, seq int64, eventType string) {
+	if lastSeq, exists := ing.seqNums[ticker]; exists {
+		if seq != lastSeq+1 && eventType == "delta" {
+			ing.logger.Warn("sequence number gap detected", "marketTicker", ticker, "expected", lastSeq+1, "received", seq, "missed", seq-lastSeq-1)
 			// TODO: trigger a REST snapshot resync here
 		}
 	}
-	ing.seqNums[data.MarketTicker] = msg.Seq
-	// convert raw [[price, quantity], ...] arrays into []PriceLevel structs
-	event := models.OrderBookEvent{
-		Type: eventType,
-		MarketTicker: data.MarketTicker,
-		SeqNum: msg.Seq,
-		YesBids: parseLevels(data.YesBids),
-		NoBids: parseLevels(data.NoBids),
-		ReceivedAt: time.Now(),
-	}
-	// push to the channel
-	ing.eventChannel <- event
-	ing.logger.Debug("event forwarded", "type", eventType, "ticker", data.MarketTicker, "seqNum", msg.Seq, "yesLevels", len(event.YesBids), "noLevels", len(event.NoBids))
+	ing.seqNums[ticker] = seq
 }
 
-// converts Kalshi's [[price, quantity], ...] format into []PriceLevel
-func parseLevels(rawLevels [][]int) []models.PriceLevel {
+// converts Kalshi's [[price_dollars, quantity], ...] fixed-point string pairs into []models.PriceLevel
+func parseLevels(rawLevels [][]string) ([]models.PriceLevel, error) {
 	levels := make([]models.PriceLevel, 0, len(rawLevels))
 	for _, pair := range rawLevels {
 		if len(pair) != 2 {
 			continue // skip malformed entries
 		}
+		price, err := models.ParseFixedPoint(pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid price %q: %w", pair[0], err)
+		}
+		quantity, err := models.ParseFixedPoint(pair[1])
+		if err != nil {
+			return nil, fmt.Errorf("invalid quantity %q: %w", pair[1], err)
+		}
 		levels = append(levels, models.PriceLevel{
-			Price: pair[0],
-			Quantity: pair[1],
+			Price: price,
+			Quantity: quantity,
 		})
 	}
-	return levels
+	return levels, nil
 }
